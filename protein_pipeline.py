@@ -130,3 +130,190 @@ def check_dependencies(tools):
         sys.exit(1)
 
     print("[OK] All required tools are available.\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 1: Interactive user input
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_user_inputs():
+    """
+    Prompt the user interactively for protein family, taxonomic group,
+    and output directory name.
+
+    Validates that protein family and taxon are non-empty strings.
+    Defaults output directory to "pipeline_output" if left blank.
+
+    Returns
+    -------
+    tuple : (protein_family str, taxon str, outdir str)
+    """
+    print("=" * 62)
+    print("  Protein Family Conservation & Motif Pipeline")
+    print("=" * 62)
+    print()
+    print("This programme will:")
+    print("  1. Fetch protein sequences from NCBI for your query.")
+    print("  2. Report species diversity and ask whether to proceed.")
+    print("  3. Align sequences and plot conservation.")
+    print("  4. Scan for PROSITE motifs (patmatmotifs).")
+    print("  5. Optionally run pepstats (physicochemical properties).")
+    print()
+    print(f"  Note: up to {MAX_SEQS_FETCH} sequences will be fetched from NCBI.")
+    print()
+
+    # Get protein family name - must not be empty
+    protein_family = input(
+        "Enter protein family name\n"
+        "  (e.g. glucose-6-phosphatase, ABC transporter, kinase): "
+    ).strip()
+    if not protein_family:
+        print("[ERROR] Protein family name cannot be empty. Exiting.")
+        sys.exit(1)
+
+    # Get taxonomic group - must not be empty
+    taxon = input(
+        "\nEnter taxonomic group (scientific name)\n"
+        "  (e.g. Aves, Mammalia, Rodentia, Vertebrata): "
+    ).strip()
+    if not taxon:
+        print("[ERROR] Taxonomic group cannot be empty. Exiting.")
+        sys.exit(1)
+
+    # Get output directory - default if blank
+    outdir = input(
+        "\nEnter output directory name [default: pipeline_output]: "
+    ).strip()
+    if not outdir:
+        outdir = "pipeline_output"
+
+    print()
+    return protein_family, taxon, outdir
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 2: Create output directory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def make_outdir(outdir):
+    """
+    Create the output directory. If it already exists, warn the user
+    and ask whether to continue (existing files may be overwritten).
+
+    Exits cleanly if the user declines to continue.
+
+    Parameters
+    ----------
+    outdir : str - path to the output directory
+    """
+    if os.path.exists(outdir):
+        print(f"[WARNING] Output directory '{outdir}' already exists.")
+        print("          Existing files may be overwritten.")
+        ans = input("          Continue anyway? [y/N]: ").strip().lower()
+        if ans != "y":
+            print("Exiting. Choose a different output directory and re-run.")
+            sys.exit(0)
+    else:
+        os.makedirs(outdir)
+        print(f"[OK] Created output directory: {outdir}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 3: Search NCBI and fetch sequences via EDirect
+# ─────────────────────────────────────────────────────────────────────────────
+
+def fetch_sequences(protein_family, taxon, outdir):
+    """
+    Use NCBI EDirect (esearch + efetch) to retrieve protein sequences
+    in FASTA format.
+
+    NCBI query constructed as:
+        "<protein_family>"[Protein Name] AND "<taxon>"[Organism]
+
+    Runs esearch first to count hits before fetching, so the user
+    can be warned if the dataset is very large.
+
+    Saves results to <outdir>/sequences_raw.fasta.
+
+    Parameters
+    ----------
+    protein_family : str
+    taxon          : str
+    outdir         : str
+
+    Returns
+    -------
+    tuple : (raw_fasta_path str, query_string str)
+    """
+    query = f'"{protein_family}"[Protein Name] AND "{taxon}"[Organism]'
+    print(f"[Step 1] Searching NCBI protein database...")
+    print(f"         Query: {query}\n")
+
+    # First call: count how many sequences match the query
+    search_xml = run_cmd(
+        ["esearch", "-db", "protein", "-query", query],
+        description="esearch (count)"
+    )
+
+    # Parse the <Count> tag from the esearch XML output
+    count_match = re.search(r"<Count>(\d+)</Count>", search_xml)
+    if not count_match:
+        print("[ERROR] Could not parse hit count from esearch XML output.")
+        print("        Raw output preview:")
+        print(search_xml[:400])
+        sys.exit(1)
+
+    count = int(count_match.group(1))
+    print(f"         NCBI reports {count} sequence(s) matching your query.")
+
+    # Exit with helpful suggestions if nothing is found
+    if count == 0:
+        print("\n[ERROR] No sequences found for this query.")
+        print("        Suggestions:")
+        print("          - Check the spelling of the protein family name.")
+        print("          - Try a broader taxonomic group (e.g. Vertebrata).")
+        print("          - Try a simpler protein name (e.g. 'kinase').")
+        sys.exit(1)
+
+    # Warn if dataset is very large and ask for confirmation
+    if count > MAX_SEQS_FETCH:
+        print(f"\n[WARNING] {count} sequences found; limit is {MAX_SEQS_FETCH}.")
+        print(f"          Only the first {MAX_SEQS_FETCH} will be retrieved.")
+        print("          Consider using a more specific taxon or protein name.")
+        ans = input(f"          Proceed with {MAX_SEQS_FETCH} sequences? [y/N]: "
+                    ).strip().lower()
+        if ans != "y":
+            print("Exiting.")
+            sys.exit(0)
+        retmax = MAX_SEQS_FETCH
+    else:
+        retmax = count
+
+    # Second call: fetch sequences in FASTA format
+    # esearch XML output is piped into efetch via input_data argument
+    print(f"\n[Step 1] Fetching {retmax} sequence(s) from NCBI...")
+
+    esearch_xml = run_cmd(
+        ["esearch", "-db", "protein", "-query", query],
+        description="esearch (for fetch)"
+    )
+    fasta_data = run_cmd(
+        ["efetch", "-db", "protein", "-format", "fasta",
+         "-retmax", str(retmax)],
+        description="efetch",
+        input_data=esearch_xml
+    )
+
+    # Check efetch actually returned something
+    if not fasta_data.strip():
+        print("[ERROR] efetch returned no data.")
+        print("        Check your internet connection and NCBI availability.")
+        sys.exit(1)
+
+    # Save raw sequences to file
+    raw_fasta = os.path.join(outdir, "sequences_raw.fasta")
+    with open(raw_fasta, "w") as fh:
+        fh.write(fasta_data)
+
+    print(f"[OK] Raw sequences saved to: {raw_fasta}")
+    return raw_fasta, query
