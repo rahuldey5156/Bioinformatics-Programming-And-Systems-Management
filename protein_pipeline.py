@@ -581,7 +581,6 @@ def run_plotcon(aligned_fasta, outdir):
         print("[WARNING] plotcon PNG not found at expected path.")
         print("          Check the output directory for any .png files.")
 
-    # Run the pure-Python conservation scoring as well
     compute_python_conservation(aligned_fasta, outdir)
 
 
@@ -634,7 +633,6 @@ def compute_python_conservation(aligned_fasta, outdir):
     print(f"         Columns >= 80% identical: {high_cons}"
           f" ({100 * high_cons / aln_len:.1f}%)")
 
-    # Save tab-delimited scores file
     cons_file = os.path.join(outdir, "conservation_scores.txt")
     with open(cons_file, "w") as fh:
         fh.write("Column\tConservation_Score\n")
@@ -642,7 +640,6 @@ def compute_python_conservation(aligned_fasta, outdir):
             fh.write(f"{i}\t{s:.4f}\n")
     print(f"[OK] Per-column conservation scores saved to: {cons_file}")
 
-    # Print ASCII bar chart sampled across the alignment
     print("\n         Conservation profile (sampled every ~2%):")
     sample_step = max(1, aln_len // 50)
     for col in range(0, aln_len, sample_step):
@@ -707,24 +704,20 @@ def run_prosite_scan(records, outdir):
     prosite_dir = os.path.join(outdir, "prosite_results")
     os.makedirs(prosite_dir, exist_ok=True)
 
-    # motif_label -> list of accession strings that contain the motif
     motif_summary = collections.defaultdict(list)
     n_with_hits   = 0
 
     for i, (header, seq) in enumerate(records):
 
-        # Derive a safe filename from the first token of the header
         acc      = header.split()[0].replace("/", "_").replace("|", "_")
         seq_file = os.path.join(prosite_dir, f"{acc}.fasta")
         out_file = os.path.join(prosite_dir, f"{acc}.patmatmotifs")
 
-        # Write single-sequence FASTA for patmatmotifs input
         with open(seq_file, "w") as fh:
             fh.write(f">{header}\n")
             for j in range(0, len(seq), 60):
                 fh.write(seq[j:j+60] + "\n")
 
-        # Run patmatmotifs - non-fatal if non-zero exit (no hits case)
         subprocess.run(
             ["patmatmotifs", "-sequence", seq_file,
              "-outfile", out_file, "-full", "Y"],
@@ -732,20 +725,17 @@ def run_prosite_scan(records, outdir):
             text=True
         )
 
-        # Parse any motifs found from the output file
         motifs = parse_patmatmotifs(out_file)
         if motifs:
             n_with_hits += 1
             for motif in motifs:
                 motif_summary[motif].append(acc)
 
-        # Print a progress counter every 10 sequences
         if (i + 1) % 10 == 0 or (i + 1) == len(records):
             print(f"         Scanned {i+1}/{len(records)} sequences...", end="\r")
 
-    print()  # newline after progress line
+    print()
 
-    # Write the combined motif summary report
     summary_file = os.path.join(outdir, "prosite_summary.txt")
     with open(summary_file, "w") as fh:
         fh.write("PROSITE Motif Scan Summary\n")
@@ -770,3 +760,166 @@ def run_prosite_scan(records, outdir):
                                   key=lambda x: -len(x[1]))[:10]:
             print(f"       {motif:<45} in {len(accs)} sequence(s)")
     print(f"[OK] Summary saved to: {summary_file}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 9: Optional EMBOSS pepstats analysis
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_pepstats(raw_fasta, outdir):
+    """
+    Run EMBOSS pepstats on all fetched sequences.
+    Computes molecular weight, isoelectric point, and amino acid composition.
+
+    Parses the output in Python to extract MW and pI values and prints
+    a summary (mean, min, max) to screen.
+
+    Parameters
+    ----------
+    raw_fasta : str - path to sequences_raw.fasta
+    outdir    : str
+    """
+    print(f"\n[Step 7] Running EMBOSS pepstats (physicochemical properties)...")
+
+    pepstats_out = os.path.join(outdir, "pepstats_results.txt")
+
+    run_cmd(
+        [
+            "pepstats",
+            "-sequence", raw_fasta,
+            "-outfile",  pepstats_out
+        ],
+        description="pepstats"
+    )
+
+    # Parse MW and pI values from the pepstats output using regex
+    mw_values = []
+    pi_values = []
+
+    with open(pepstats_out, "r") as fh:
+        for line in fh:
+            mw_match = re.search(r"Molecular weight\s*=\s*([\d.]+)", line)
+            pi_match = re.search(r"Isoelectric Point\s*=\s*([\d.]+)", line)
+            if mw_match:
+                mw_values.append(float(mw_match.group(1)))
+            if pi_match:
+                pi_values.append(float(pi_match.group(1)))
+
+    if mw_values:
+        mean_mw = sum(mw_values) / len(mw_values)
+        min_mw  = min(mw_values)
+        max_mw  = max(mw_values)
+        mean_pi = sum(pi_values) / len(pi_values) if pi_values else float("nan")
+        min_pi  = min(pi_values) if pi_values else float("nan")
+        max_pi  = max(pi_values) if pi_values else float("nan")
+
+        print(f"\n         [pepstats Summary]")
+        print(f"         Sequences analysed     : {len(mw_values)}")
+        print(f"         Molecular weight (Da)  :"
+              f" mean={mean_mw:,.1f}  min={min_mw:,.1f}  max={max_mw:,.1f}")
+        print(f"         Isoelectric point      :"
+              f" mean={mean_pi:.2f}  min={min_pi:.2f}  max={max_pi:.2f}")
+        print(f"[OK] Full pepstats output saved to: {pepstats_out}")
+    else:
+        print("[WARNING] Could not parse MW/pI values from pepstats output.")
+        print(f"          Raw output saved to: {pepstats_out}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 10: Write final pipeline summary report
+# ─────────────────────────────────────────────────────────────────────────────
+
+def write_summary_report(protein_family, taxon, query,
+                         n_fetched, n_aligned, outdir):
+    """
+    Write a plain-text summary of the entire pipeline run, listing
+    the query used, sequence counts, and all output files with sizes.
+
+    Parameters
+    ----------
+    protein_family : str
+    taxon          : str
+    query          : str  - NCBI query string used
+    n_fetched      : int  - total sequences retrieved
+    n_aligned      : int  - sequences used in alignment
+    outdir         : str
+    """
+    report_file = os.path.join(outdir, "pipeline_summary.txt")
+    with open(report_file, "w") as fh:
+        fh.write("=" * 62 + "\n")
+        fh.write("  Pipeline Summary Report\n")
+        fh.write("=" * 62 + "\n\n")
+        fh.write(f"Protein family  : {protein_family}\n")
+        fh.write(f"Taxonomic group : {taxon}\n")
+        fh.write(f"NCBI query      : {query}\n\n")
+        fh.write(f"Sequences retrieved : {n_fetched}\n")
+        fh.write(f"Sequences aligned   : {n_aligned}\n\n")
+        fh.write("Output files:\n")
+        fh.write("-" * 62 + "\n")
+        for fname in sorted(os.listdir(outdir)):
+            fpath = os.path.join(outdir, fname)
+            if os.path.isfile(fpath):
+                size = os.path.getsize(fpath)
+                fh.write(f"  {fname:<48} {size:>10,} bytes\n")
+        fh.write("\nPipeline completed successfully.\n")
+
+    print(f"\n[OK] Pipeline summary saved to: {report_file}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    """
+    Main entry point. Calls each pipeline step in sequence.
+    Return values from each step are passed into the next as needed.
+    """
+
+    # 0. Check all required tools are on PATH before doing anything else
+    required_tools = ["esearch", "efetch", "clustalo",
+                      "plotcon", "patmatmotifs", "pepstats"]
+    check_dependencies(required_tools)
+
+    # 1. Get user inputs interactively
+    protein_family, taxon, outdir = get_user_inputs()
+
+    # 2. Create output directory
+    make_outdir(outdir)
+
+    # 3. Fetch sequences from NCBI
+    raw_fasta, query = fetch_sequences(protein_family, taxon, outdir)
+
+    # 4. Parse FASTA and assess species diversity
+    records   = parse_fasta(raw_fasta)
+    records   = assess_diversity(records, outdir)
+    n_fetched = len(records)
+
+    # 5. Subsample to MAX_SEQS_CONSERVATION if needed
+    align_fasta, n_aligned = subsample_for_alignment(records, outdir)
+
+    # 6. Multiple sequence alignment
+    aligned_fasta = run_alignment(align_fasta, outdir)
+
+    # 7. Conservation plot and Python per-column scoring
+    run_plotcon(aligned_fasta, outdir)
+
+    # 8. PROSITE motif scan on all fetched sequences
+    run_prosite_scan(records, outdir)
+
+    # 9. Optional pepstats analysis
+    ans = input("\nRun optional EMBOSS pepstats analysis? [y/N]: ").strip().lower()
+    if ans == "y":
+        run_pepstats(raw_fasta, outdir)
+
+    # 10. Final summary report
+    write_summary_report(protein_family, taxon, query,
+                         n_fetched, n_aligned, outdir)
+
+    print("\n" + "=" * 62)
+    print(f"  All done! Results saved to: {outdir}/")
+    print("=" * 62 + "\n")
+
+
+if __name__ == "__main__":
+    main()

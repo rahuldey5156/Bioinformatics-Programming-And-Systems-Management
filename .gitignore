@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+
+# Pipeline output directories
+pipeline_output/
+*_results/
+*_output/
+
+# FASTA and sequence files generated during runs
+*.fasta
+*.fa
+
+# EMBOSS output files
+*.patmatmotifs
+*.png
+*.1.png
+
+# Text outputs from pipeline runs
+pepstats_results.txt
+conservation_scores.txt
+species_diversity.txt
+prosite_summary.txt
+pipeline_summary.txt
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
