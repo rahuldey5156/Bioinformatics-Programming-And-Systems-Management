@@ -243,7 +243,6 @@ def fetch_sequences(protein_family, taxon, outdir):
     print(f"[Step 1] Searching NCBI protein database...")
     print(f"         Query: {query}\n")
 
-    # First call: count how many sequences match the query
     search_xml = run_cmd(
         ["esearch", "-db", "protein", "-query", query],
         description="esearch (count)"
@@ -280,8 +279,6 @@ def fetch_sequences(protein_family, taxon, outdir):
     else:
         retmax = count
 
-    # Second call: fetch sequences in FASTA format
-    # esearch XML output is piped into efetch via input_data argument
     print(f"\n[Step 1] Fetching {retmax} sequence(s) from NCBI...")
 
     esearch_xml = run_cmd(
@@ -341,7 +338,6 @@ def parse_fasta(filepath):
             elif line:
                 seq_parts.append(line.upper())
 
-    # Make sure the final record is not lost after the loop ends
     if header is not None:
         records.append((header, "".join(seq_parts)))
 
@@ -493,16 +489,284 @@ def subsample_for_alignment(records, outdir):
         print("         Method: sort by descending sequence length,"
               " pick evenly-spaced subset.")
 
-        # Sort by descending length to favour more complete sequences
         sorted_recs = sorted(records, key=lambda r: len(r[1]), reverse=True)
-
-        # Pick evenly spaced indices across the sorted list
-        step    = n / MAX_SEQS_CONSERVATION
-        indices = [int(i * step) for i in range(MAX_SEQS_CONSERVATION)]
-        subset  = [sorted_recs[i] for i in indices]
+        step        = n / MAX_SEQS_CONSERVATION
+        indices     = [int(i * step) for i in range(MAX_SEQS_CONSERVATION)]
+        subset      = [sorted_recs[i] for i in indices]
 
         write_fasta(subset, align_fasta)
         print(f"[OK] Subsampled FASTA ({MAX_SEQS_CONSERVATION} seqs) saved to:"
               f" {align_fasta}")
 
     return align_fasta, min(n, MAX_SEQS_CONSERVATION)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 6: Multiple sequence alignment with clustalo
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_alignment(input_fasta, outdir):
+    """
+    Align sequences using Clustal Omega (clustalo).
+    Output format is Pearson/FASTA (--outfmt=fasta).
+
+    Parameters
+    ----------
+    input_fasta : str - path to unaligned FASTA
+    outdir      : str
+
+    Returns
+    -------
+    str - path to the aligned FASTA file
+    """
+    aligned_fasta = os.path.join(outdir, "sequences_aligned.fasta")
+    print(f"\n[Step 4] Running multiple sequence alignment (clustalo)...")
+
+    run_cmd(
+        [
+            "clustalo",
+            "-i",        input_fasta,
+            "-o",        aligned_fasta,
+            "--outfmt=fasta",
+            "--force",
+            "-v"
+        ],
+        description="clustalo"
+    )
+
+    print(f"[OK] Aligned FASTA saved to: {aligned_fasta}")
+    return aligned_fasta
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 7: Conservation analysis - EMBOSS plotcon + Python column scoring
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_plotcon(aligned_fasta, outdir):
+    """
+    (a) Run EMBOSS plotcon to produce a graphical conservation plot (PNG).
+    (b) Compute a pure-Python per-column identity score from the alignment,
+        save as a text file, and print an ASCII profile to screen.
+
+    Parameters
+    ----------
+    aligned_fasta : str - path to aligned FASTA
+    outdir        : str
+    """
+    print(f"\n[Step 5] Running EMBOSS plotcon (conservation plot)...")
+
+    goutfile_base = os.path.join(outdir, "conservation_plot")
+
+    run_cmd(
+        [
+            "plotcon",
+            "-sequences", aligned_fasta,
+            "-winsize",   "4",
+            "-graph",     "png",
+            "-goutfile",  goutfile_base
+        ],
+        description="plotcon"
+    )
+
+    # EMBOSS plotcon appends .1.png to the goutfile name
+    emboss_png = goutfile_base + ".1.png"
+    target_png = goutfile_base + ".png"
+
+    if os.path.exists(emboss_png):
+        os.rename(emboss_png, target_png)
+        print(f"[OK] Conservation plot saved to: {target_png}")
+    elif os.path.exists(target_png):
+        print(f"[OK] Conservation plot saved to: {target_png}")
+    else:
+        print("[WARNING] plotcon PNG not found at expected path.")
+        print("          Check the output directory for any .png files.")
+
+    # Run the pure-Python conservation scoring as well
+    compute_python_conservation(aligned_fasta, outdir)
+
+
+def compute_python_conservation(aligned_fasta, outdir):
+    """
+    Pure-Python per-column conservation scoring for a multiple alignment.
+
+    For each alignment column, calculates the fraction of non-gap residues
+    that match the most common residue (identity-based conservation score).
+    Score range: 0.0 (fully variable) to 1.0 (fully identical).
+
+    Saves per-column scores to a tab-delimited text file.
+    Prints a summary and ASCII bar chart to screen.
+
+    Parameters
+    ----------
+    aligned_fasta : str - path to aligned FASTA
+    outdir        : str
+    """
+    records = parse_fasta(aligned_fasta)
+    if not records:
+        print("[WARNING] Could not parse aligned FASTA; skipping conservation.")
+        return
+
+    sequences = [seq.upper() for _, seq in records]
+    n_seqs    = len(sequences)
+    aln_len   = max(len(s) for s in sequences)
+
+    # Pad any shorter sequences to alignment length with gap characters
+    sequences = [s.ljust(aln_len, "-") for s in sequences]
+
+    # Score each column using Counter to find the most common residue
+    scores = []
+    for col in range(aln_len):
+        column  = [sequences[i][col] for i in range(n_seqs)]
+        non_gap = [c for c in column if c != "-"]
+        if not non_gap:
+            scores.append(0.0)
+            continue
+        top_count = collections.Counter(non_gap).most_common(1)[0][1]
+        scores.append(top_count / len(non_gap))
+
+    avg_score = sum(scores) / len(scores)
+    high_cons = sum(1 for s in scores if s >= 0.8)
+
+    print(f"\n         [Python Conservation Summary]")
+    print(f"         Alignment length        : {aln_len} columns")
+    print(f"         Number of sequences     : {n_seqs}")
+    print(f"         Mean conservation score : {avg_score:.3f}")
+    print(f"         Columns >= 80% identical: {high_cons}"
+          f" ({100 * high_cons / aln_len:.1f}%)")
+
+    # Save tab-delimited scores file
+    cons_file = os.path.join(outdir, "conservation_scores.txt")
+    with open(cons_file, "w") as fh:
+        fh.write("Column\tConservation_Score\n")
+        for i, s in enumerate(scores, 1):
+            fh.write(f"{i}\t{s:.4f}\n")
+    print(f"[OK] Per-column conservation scores saved to: {cons_file}")
+
+    # Print ASCII bar chart sampled across the alignment
+    print("\n         Conservation profile (sampled every ~2%):")
+    sample_step = max(1, aln_len // 50)
+    for col in range(0, aln_len, sample_step):
+        bar = "█" * int(scores[col] * 30)
+        print(f"         {col+1:>6} | {bar:<30}  {scores[col]:.2f}")
+    print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STEP 8: PROSITE motif scan with EMBOSS patmatmotifs
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_patmatmotifs(result_file):
+    """
+    Parse a patmatmotifs output file and return a list of unique motif labels.
+
+    patmatmotifs output contains lines like:
+        Motif = PS00107  PROTEIN_KINASE_ATP
+
+    Parameters
+    ----------
+    result_file : str - path to patmatmotifs output file
+
+    Returns
+    -------
+    list of str - unique motif labels found
+    """
+    motifs = set()
+    if not os.path.exists(result_file):
+        return []
+
+    with open(result_file, "r") as fh:
+        for line in fh:
+            m = re.search(r"Motif\s*=\s*(\S+)\s*(.*)", line)
+            if m:
+                motif_id   = m.group(1).strip()
+                motif_name = m.group(2).strip()
+                motifs.add(f"{motif_id} {motif_name}".strip())
+
+    return list(motifs)
+
+
+def run_prosite_scan(records, outdir):
+    """
+    Run EMBOSS patmatmotifs on each sequence individually against the
+    PROSITE motif database.
+
+    Individual results saved under <outdir>/prosite_results/.
+    Combined summary saved to <outdir>/prosite_summary.txt.
+
+    Note: patmatmotifs is called via subprocess.run() directly rather
+    than run_cmd() because some EMBOSS versions return a non-zero exit
+    code when no motifs are found, which is not an error condition.
+
+    Parameters
+    ----------
+    records : list of (str, str)
+    outdir  : str
+    """
+    print(f"\n[Step 6] Scanning for PROSITE motifs (patmatmotifs)...")
+
+    prosite_dir = os.path.join(outdir, "prosite_results")
+    os.makedirs(prosite_dir, exist_ok=True)
+
+    # motif_label -> list of accession strings that contain the motif
+    motif_summary = collections.defaultdict(list)
+    n_with_hits   = 0
+
+    for i, (header, seq) in enumerate(records):
+
+        # Derive a safe filename from the first token of the header
+        acc      = header.split()[0].replace("/", "_").replace("|", "_")
+        seq_file = os.path.join(prosite_dir, f"{acc}.fasta")
+        out_file = os.path.join(prosite_dir, f"{acc}.patmatmotifs")
+
+        # Write single-sequence FASTA for patmatmotifs input
+        with open(seq_file, "w") as fh:
+            fh.write(f">{header}\n")
+            for j in range(0, len(seq), 60):
+                fh.write(seq[j:j+60] + "\n")
+
+        # Run patmatmotifs - non-fatal if non-zero exit (no hits case)
+        subprocess.run(
+            ["patmatmotifs", "-sequence", seq_file,
+             "-outfile", out_file, "-full", "Y"],
+            capture_output=True,
+            text=True
+        )
+
+        # Parse any motifs found from the output file
+        motifs = parse_patmatmotifs(out_file)
+        if motifs:
+            n_with_hits += 1
+            for motif in motifs:
+                motif_summary[motif].append(acc)
+
+        # Print a progress counter every 10 sequences
+        if (i + 1) % 10 == 0 or (i + 1) == len(records):
+            print(f"         Scanned {i+1}/{len(records)} sequences...", end="\r")
+
+    print()  # newline after progress line
+
+    # Write the combined motif summary report
+    summary_file = os.path.join(outdir, "prosite_summary.txt")
+    with open(summary_file, "w") as fh:
+        fh.write("PROSITE Motif Scan Summary\n")
+        fh.write("=" * 60 + "\n\n")
+        fh.write(f"Sequences scanned      : {len(records)}\n")
+        fh.write(f"Sequences with hits    : {n_with_hits}\n\n")
+        if motif_summary:
+            fh.write(f"{'Motif':<45} {'Occurrences':>12}\n")
+            fh.write("-" * 59 + "\n")
+            for motif, accs in sorted(motif_summary.items(),
+                                      key=lambda x: -len(x[1])):
+                fh.write(f"{motif:<45} {len(accs):>12}\n")
+        else:
+            fh.write("No PROSITE motifs found in any sequence.\n")
+
+    print(f"\n[OK] PROSITE scan complete.")
+    print(f"     Sequences with hits : {n_with_hits}/{len(records)}")
+    print(f"     Unique motifs found : {len(motif_summary)}")
+    if motif_summary:
+        print("\n     Top motifs:")
+        for motif, accs in sorted(motif_summary.items(),
+                                  key=lambda x: -len(x[1]))[:10]:
+            print(f"       {motif:<45} in {len(accs)} sequence(s)")
+    print(f"[OK] Summary saved to: {summary_file}")
