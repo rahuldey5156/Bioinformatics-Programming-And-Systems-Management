@@ -286,8 +286,7 @@ def fetch_sequences(protein_family, taxon, outdir):
         description="esearch (for fetch)"
     )
     fasta_data = run_cmd(
-        ["efetch", "-db", "protein", "-format", "fasta",
-         "-retmax", str(retmax)],
+        ["efetch", "-db", "protein", "-format", "fasta"],
         description="efetch",
         input_data=esearch_xml
     )
